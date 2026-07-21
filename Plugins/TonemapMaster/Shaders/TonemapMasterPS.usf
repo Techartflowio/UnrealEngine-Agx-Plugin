@@ -1,0 +1,203 @@
+// Copyright (c) 2026. TonemapMaster plugin.
+//
+// Pass B — per-pixel tonemap replacement. Runs at
+// EPostProcessingPass::ReplacingTonemapper; input is HDR linear scene color
+// (pre-exposed) plus the combined bloom texture, output is display-referred.
+//
+// This is a PORT of the essential per-pixel flow of the engine's
+//   Engine/Shaders/Private/PostProcessTonemap.usf (UE 5.8, TonemapCommonPS):
+// scene color + bloom -> exposure (OneOverPreExposure * EyeAdaptation) ->
+// vignette -> 3D grading LUT sample with the engine's LinToLog/ST2084 shaper
+// and scale/offset math (ColorLookupTable, engine lines ~190-211) ->
+// backbuffer quantization dithering. The LUT is built once per frame by the
+// plugin's Pass A (TonemapMasterCombineLUTs.usf) and contains the full engine
+// color grading + AgX tone curve + output-device encoding.
+//
+// NOT ported from the engine tonemapper (deliberately unsupported):
+//   film grain, sharpening, local exposure (bilateral / exposure fusion),
+//   chromatic aberration color fringe, bloom dirt mask, the mobile gamma-only
+//   path, the OutLuminance second render target, and Metal MSAA HDR decode.
+
+#include "/Engine/Private/Common.ush"
+#include "/Engine/Private/PostProcessCommon.ush"
+#include "/Engine/Private/TonemapCommon.ush"
+#include "/Engine/Private/ScreenPass.ush"
+
+#ifndef USE_VIGNETTE_TEXTURE
+#define USE_VIGNETTE_TEXTURE 0
+#endif
+
+#ifndef USE_ADVANCED_VIGNETTE
+#define USE_ADVANCED_VIGNETTE 0
+#endif
+
+SCREEN_PASS_TEXTURE_VIEWPORT(Color)
+SCREEN_PASS_TEXTURE_VIEWPORT(Output)
+SCREEN_PASS_TEXTURE_VIEWPORT(Bloom)
+
+Texture2D ColorTexture;
+SamplerState ColorSampler;
+
+Texture2D BloomTexture;
+SamplerState BloomSampler;
+
+StructuredBuffer<float4> EyeAdaptationBuffer;
+
+FScreenTransform ColorToBloom;
+
+// xyz: SceneColorTint.rgb, w: unused (engine: PostProcessTonemap.cpp CommonParameters.ColorScale0)
+float4 ColorScale0;
+
+// Vignette (engine: PostProcessTonemap.cpp lines ~889-896)
+float4 VignetteParams0;
+float4 VignetteParams1;
+float  VignetteParams2;
+uint   VignetteType;
+#if USE_VIGNETTE_TEXTURE
+Texture2D VignetteTexture;
+SamplerState VignetteTextureSampler;
+#endif
+
+// Lens viewport mapping (engine: PostProcessTonemap.cpp lines ~947, ~1014-1017)
+float4 LensPrincipalPointOffsetScale;
+float4 LensPrincipalPointOffsetScaleInverse;
+
+// Grading LUT built by Pass A (TonemapMasterCombineLUTs.usf)
+Texture3D ColorGradingLUT;
+SamplerState ColorGradingLUTSampler;
+
+uint LUTShaper;
+float LUTMax;
+float LUTScale; // (LUTSize - 1) / LUTSize
+float LUTOffset; // 0.5 / LUTSize
+
+// Backbuffer quantization dithering (engine: PostProcessTonemap.cpp ~916-941)
+float BackbufferQuantizationDithering;
+float3 GrainRandomFull;
+
+// converts from screen [-1,1] space to the lens [-1,1] viewport space
+float2 ConvertScreenViewportSpaceToLensViewportSpace(float2 UV)
+{
+	return LensPrincipalPointOffsetScale.xy + UV * LensPrincipalPointOffsetScale.zw;
+}
+
+float2 ConvertLensViewportSpaceToScreenViewportSpace(float2 UV)
+{
+	// optimized version (engine comment: UV = (UV - Offset.xy) / Offset.zw)
+	return LensPrincipalPointOffsetScaleInverse.xy + UV * LensPrincipalPointOffsetScaleInverse.zw;
+}
+
+// can be optimized
+float2 ScreenPosToUV(float2 ScreenPos, float2 ExtentInverse)
+{
+	float2 UV = (ScreenPos * Color_ScreenPosToViewportScale + Color_ScreenPosToViewportBias) * ExtentInverse;
+
+	return UV;
+}
+
+float2 UVToScreenPos(float2 UV, float2 Extent)
+{
+	return (UV * Extent - Color_ScreenPosToViewportBias) / Color_ScreenPosToViewportScale;
+}
+
+half GrainFromUV(float2 GrainUV)
+{
+	half Grain = frac(sin(GrainUV.x + GrainUV.y * 543.31) * 493013.0);
+	return Grain;
+}
+
+// Ported from PostProcessTonemap.usf ColorLookupTable (engine lines ~190-211).
+half3 ColorLookupTable( half3 LinearColor )
+{
+	float3 LUTEncodedColor;
+	// Encode as ST-2084 (Dolby PQ) values
+	BRANCH
+	if (LUTShaper)
+	{
+		// ST2084 expects to receive linear values 0-10000 in nits.
+		// So the linear value must be multiplied by a scale factor to convert to nits.
+		// We don't send negative values to LinearToST2084 as it will result in NaN because of pow.
+		LUTEncodedColor = LinearToST2084(clamp(LinearColor * LinearToNitsScale, 0.0, 10000.0));
+	}
+	else
+	{
+		LUTEncodedColor = LinToLog( LinearColor + LogToLin( 0 ) );
+	}
+
+	float3 UVW = LUTEncodedColor * LUTScale + LUTOffset;
+
+	half3 OutDeviceColor = Texture3DSample( ColorGradingLUT, ColorGradingLUTSampler, UVW ).rgb;
+	return OutDeviceColor * LUTMax;
+}
+
+void MainPS(
+	in noperspective float2 InUV : TEXCOORD0,
+	out float4 OutColor : SV_Target0)
+{
+	// Ported from TonemapCommonPS (engine: PostProcessTonemap.usf lines ~301-608),
+	// non-gamma-only desktop path, minus the unsupported features listed in the
+	// header comment.
+	const float OneOverPreExposure = View.OneOverPreExposure;
+	const float GlobalExposure = EyeAdaptationBuffer[0].x;
+
+	// Sample the scene color (clamped like the engine's SampleSceneColor).
+	const float2 SceneUV = clamp(InUV, Color_UVViewportBilinearMin, Color_UVViewportBilinearMax);
+	const float4 SceneColor = Texture2DSample(ColorTexture, ColorSampler, SceneUV);
+
+	// Screen position in [-1, 1] space (engine computes this in the VS; we do
+	// it in the PS since AddDrawScreenPass only forwards the UV).
+	const float2 ScreenPos = UVToScreenPos(InUV, Color_Extent);
+
+	// Sample bloom.
+	float3 Bloom;
+	{
+		float2 BloomUV = ApplyScreenTransform(InUV, ColorToBloom);
+		BloomUV = clamp(BloomUV, Bloom_UVViewportBilinearMin, Bloom_UVViewportBilinearMax);
+		Bloom = Texture2DSample(BloomTexture, BloomSampler, BloomUV).rgb;
+	}
+
+	// Compute scene color tint (engine: ColorScale0 = PostProcessSettings.SceneColorTint).
+	const float3 SceneColorTint = ColorScale0.rgb;
+
+	// Compute the vignette circle-space position (engine does this in
+	// TonemapCommonVS using the Output viewport; PostProcessTonemap.usf ~241-247).
+	const float AspectRatio = Output_ViewportSize.y * Output_ViewportSizeInverse.x;
+	const float2 LensViewportPos = ConvertScreenViewportSpaceToLensViewportSpace(ScreenPos);
+	const float2 Vignette = VignetteSpace(LensViewportPos, VignetteType, AspectRatio);
+
+	// Compute vignette (engine: PostProcessCommon.ush ComputeVignetteMask).
+	float3 VignetteMask = ComputeVignetteMask(
+		Vignette, VignetteType, VignetteParams0, VignetteParams1, VignetteParams2
+#if USE_VIGNETTE_TEXTURE
+		, VignetteTexture, VignetteTextureSampler
+#endif
+	);
+
+	// Compute the final linear color space with explicitly all the terms that should affect the pre exposure.
+	float3 FinalLinearColor = SceneColor.rgb * SceneColorTint * (OneOverPreExposure * GlobalExposure * VignetteMask);
+
+	// Apply bloom.
+	FinalLinearColor += Bloom * (OneOverPreExposure * GlobalExposure * VignetteMask);
+
+	// Tonemap + color grade + output device encode via the Pass A LUT.
+	float3 OutDeviceColor = ColorLookupTable(FinalLinearColor);
+
+	OutColor.rgb = OutDeviceColor;
+
+	// Backbuffer quantization dithering (engine: PostProcessTonemap.usf ~565-602).
+	{
+		// Compute uniform grain on [0;1]
+		half UniformGrainOP = GrainFromUV(InUV + GrainRandomFull.xy);
+
+		// Compute uniform grain on [-1;1]
+		half UniformGrainNP = UniformGrainOP * 2.0 - 1.0;
+		half UniformGrainNPSign = clamp(UniformGrainNP * POSITIVE_INFINITY, half(-1.0), half(1.0));
+
+		// Compute triangular grain on [-1;1]
+		half TriangularGrainOP = UniformGrainNPSign - UniformGrainNPSign * sqrt(saturate(half(1.0) - abs(UniformGrainNP)));
+
+		OutColor.rgb += TriangularGrainOP * BackbufferQuantizationDithering;
+	}
+
+	OutColor.a = SceneColor.a;
+}

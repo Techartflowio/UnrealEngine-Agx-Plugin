@@ -1,0 +1,30 @@
+{
+	"FileVersion": 3,
+	"Version": 1,
+	"VersionName": "1.0",
+	"FriendlyName": "TonemapMaster",
+	"Description": "Replaces the engine filmic tonemapper with a custom AgX tonemapper, injected at EPostProcessingPass::ReplacingTonemapper through a SceneViewExtension. No engine source modifications.",
+	"Category": "Rendering",
+	"CreatedBy": "Mazeline",
+	"CreatedByURL": "https://mazeline.tech/",
+	"DocsURL": "",
+	"MarketplaceURL": "",
+	"SupportURL": "https://mazeline.tech/",
+	"CanContainContent": false,
+	"IsBetaVersion": false,
+	"IsExperimentalVersion": true,
+	"Installed": false,
+	"EnabledByDefault": true,
+	"Modules": [
+		{
+			"Name": "TonemapMaster",
+			"Type": "Runtime",
+			"LoadingPhase": "PostConfigInit"
+		},
+		{
+			"Name": "TonemapMasterEditor",
+			"Type": "Editor",
+			"LoadingPhase": "Default"
+		}
+	]
+}
