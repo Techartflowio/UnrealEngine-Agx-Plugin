@@ -1,6 +1,6 @@
 # UE8_TonemapMasters
 
-Unreal Engine 5 프로젝트. `Plugins/TonemapMaster` 플러그인이 엔진 기본 톤매퍼를 AgX 기반 커스텀 톤매퍼로 교체한다.
+Unreal Engine 5 프로젝트. `Plugins/TonemapMaster` 플러그인이 엔진 기본 톤매퍼를 AgX 또는 Gran Turismo 7(GT7) Color Volume Mapping 기반 커스텀 톤매퍼로 교체한다.
 
 ### 특징
 
@@ -12,7 +12,7 @@ Unreal Engine 5 프로젝트. `Plugins/TonemapMaster` 플러그인이 엔진 기
 ### 모듈 구성
 
 - **`TonemapMaster`** (Runtime, `PostConfigInit` 페이즈) — 렌더링 파이프라인 개입 로직. 글로벌 셰이더 컴파일 전에 `/Plugin/TonemapMaster` 가상 셰이더 디렉터리 매핑이 필요해 이 로딩 페이즈를 사용한다 (`TonemapMasterModule.cpp`).
-- **`TonemapMasterEditor`** (Editor) — Slate 기반 설정 패널. LevelEditor 메인 메뉴에 "Mazeline" 서브메뉴를 삽입해 tonemap master 탭 `STonemapMasterPanel`을 연다.
+- **`TonemapMasterEditor`** (Editor) — Slate 기반 설정 패널. LevelEditor 메인 메뉴에 "Mazeline" 서브메뉴를 삽입해 tonemap master 탭 `STonemapMasterPanel`을 연다. 패널에서 AgX/GT7 모드 선택과 각 모드의 파라미터 조정이 가능하다.
 
 ### 파이프라인 삽입 지점
 
@@ -23,7 +23,7 @@ Unreal Engine 5 프로젝트. `Plugins/TonemapMaster` 플러그인이 엔진 기
 **Pass A — 3D 그레이딩 LUT 빌더** (`TonemapMasterCombineLUTs.usf`, 컴퓨트 셰이더)
 
 - 엔진의 `PostProcessCombineLUTs`를 포팅. ReplacingTonemapper를 쓰면 엔진이 자체 CombineLUT 패스도 건어너뛰므로 플러그인이 직접 만든다.
-- 화이트밸런스, 컬러 그레이딩, ExpandGamut, legacy LUT, AgX 톤 커브, 출력 디바이스 EOTF 인코딩을 32³ 볼륨 LUT에 베이크한다.
+- 화이트밸런스, 컬러 그레이딩, ExpandGamut, legacy LUT, 선택한 AgX/GT7 톤 커브, 출력 디바이스 EOTF 인코딩을 32³ 볼륨 LUT에 베이크한다.
 - 캐싱: LUT에 영향을 주는 모든 입력을 `FTonemapMasterLUTKey`로 모아 CityHash64 해시, 달라질 때만 리빌드 (`TonemapMasterCombineLUTs.cpp:178`). 뷰 키는 제외해 다중 뷰가 LUT를 공유한다.
 
 **Pass B — 픽셀당 톤맵** (`TonemapMasterPS.usf`)
@@ -35,10 +35,33 @@ Unreal Engine 5 프로젝트. `Plugins/TonemapMaster` 플러그인이 엔진 기
 패널은 상태를 들고 있지 않고 CVar를 읽고/쓰는 방식이라 즉시 반영된다.
 
 - `r.TonemapMaster.Enable` (기본 1) — 0이면 구독이 꺼져 엔진 filmic 톤매퍼로 복귀
+- `r.TonemapMaster.Mode` (기본 0) — 0은 AgX, 1은 GT7 Color Volume Mapping
 - `r.TonemapMaster.Look` (Default/Golden/Punchy, 기본 Punchy)
 - `r.TonemapMaster.ContrastMode` (LUT/다항식 근사, 기본 LUT)
 
-Look/Contrast 변경은 LUT 해시 키에 포함되어 Pass A가 자동 리빌드된다.
+모드와 각 모드의 파라미터 변경은 LUT 해시 키에 포함되어 Pass A가 자동 리빌드된다. Look/Contrast 설정은 AgX 모드에서만 사용한다.
+
+## GT7 Color Volume Mapping 구현
+
+Polyphony Digital이 SIGGRAPH 2025에서 공개한 MIT 라이선스 레퍼런스 `gt7_tone_mapping.cpp`를 HLSL로 포팅했다. `r.TonemapMaster.Mode 1` 또는 에디터 패널의 **GT7 (Color Volume Mapping)** 항목으로 활성화한다.
+
+- AP1 입력을 색적응을 포함해 Rec.2020/D65로 변환하고, ICtCp 공간에서 고휘도 색상과 채도를 보존한다.
+- per-channel 톤 커브와 ICtCp 색 보존 결과를 혼합하며, 피크 부근에서는 chroma fade로 자연스럽게 수렴시킨다.
+- GT7 연산도 Pass A의 3D LUT에 베이크되므로 Pass B의 픽셀당 비용은 AgX 모드와 동일하다.
+- SDR은 100 nit 기준으로 처리한다. `TargetLuminance`는 현재 HDR 출력용으로 예약되어 있다.
+
+주요 CVar(괄호 안은 기본값):
+
+- `r.TonemapMaster.GT7.TargetLuminance` (1000.0)
+- `r.TonemapMaster.GT7.BlendRatio` (0.6)
+- `r.TonemapMaster.GT7.CurveMidPoint` (0.538)
+- `r.TonemapMaster.GT7.CurveLinearSection` (0.444)
+- `r.TonemapMaster.GT7.CurveToeStrength` (1.28)
+- `r.TonemapMaster.GT7.CurveAlpha` (0.25)
+- `r.TonemapMaster.GT7.ChromaFadeStart` (0.98)
+- `r.TonemapMaster.GT7.ChromaFadeEnd` (1.16)
+
+세부 파이프라인과 파라미터 설명은 [`Plugins/TonemapMaster/Docs/UnifiedTonemapperSystem.md`](Plugins/TonemapMaster/Docs/UnifiedTonemapperSystem.md)를 참고한다.
 
 ## AgX 구현
 
