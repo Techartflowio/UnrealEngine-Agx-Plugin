@@ -16,7 +16,7 @@ Unreal Engine 5 프로젝트. `Plugins/TonemapMaster` 플러그인이 엔진 기
 
 ### 파이프라인 삽입 지점
 
-핵심은 `FTonemapMasterSceneViewExtension::SubscribeToPostProcessingPass` (`TonemapMasterSceneViewExtension.cpp:182`). **`EPostProcessingPass::ReplacingTonemapper`**에 구독하면 엔진이 자체 톤맵 패스를 통째로 건어너뛰는 공식 훅이다. 구독 조건은 `r.TonemapMaster.Enable` 활성 + SDR 출력인 경우뿐이며, HDR 출력(ST2084/scRGB)에서는 엔진 ACES에 맡긴다.
+핵심은 `FTonemapMasterSceneViewExtension::SubscribeToPostProcessingPass` (`TonemapMasterSceneViewExtension.cpp:182`). EPostProcessingPass::ReplacingTonemapper 에 구독하면 엔진이 자체 톤맵 패스를 통째로 건어너뛰는 공식 훅이다. 구독 조건은 `r.TonemapMaster.Enable` 활성 + SDR 출력인 경우뿐이며, HDR 출력(ST2084/scRGB)에서는 엔진 ACES에 맡긴다.
 
 ### 2-패스 구조 (v2)
 
