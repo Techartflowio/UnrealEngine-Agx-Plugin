@@ -20,7 +20,7 @@ void FTonemapMasterEditorModule::StartupModule()
 		TonemapMasterTabName,
 		FOnSpawnTab::CreateRaw(this, &FTonemapMasterEditorModule::SpawnTonemapMasterTab))
 		.SetDisplayName(LOCTEXT("TabDisplayName", "Tonemap Master"))
-		.SetTooltipText(LOCTEXT("TabTooltip", "Artist settings for the TonemapMaster AgX tonemapper."))
+		.SetTooltipText(LOCTEXT("TabTooltip", "Artist settings for the TonemapMaster unified tonemapper (AgX / GT7)."))
 		.SetMenuType(ETabSpawnerMenuType::Hidden)
 		.SetIcon(FSlateIcon(FAppStyle::GetAppStyleSetName(), "ColorSpace.Icon"));
 

@@ -15,7 +15,9 @@
 // platform). Unlike the engine's cache the hash deliberately excludes the
 // view key: the LUT contents do not depend on the view, only on settings, so
 // multiple views with identical post-process settings share the LUT without
-// rebuilds. The flip side is that views with DIFFERENT settings thrash the
+// rebuilds. The key also covers the tonemapper mode (AgX vs GT7) and all GT7
+// Color Volume Mapping settings, so switching or tuning the tonemapper forces
+// a rebuild. The flip side is that views with DIFFERENT settings thrash the
 // single slot (rebuild per view per frame); a 32^3 compute dispatch is cheap
 // and multi-viewport editing with mismatched grading is rare, so this is an
 // acceptable trade-off. r.LUT.UpdateEveryFrame is not ported; set
@@ -228,6 +230,15 @@ struct FTonemapMasterLUTKey
 
 	uint32 LookMode;
 	uint32 ContrastMode;
+	uint32 TonemapperMode;
+	float GT7TargetLuminance;
+	float GT7BlendRatio;
+	float GT7CurveMidPoint;
+	float GT7CurveLinearSection;
+	float GT7CurveToeStrength;
+	float GT7CurveAlpha;
+	float GT7ChromaFadeStart;
+	float GT7ChromaFadeEnd;
 
 	FMatrix44f WorkingToXYZ;
 	FMatrix44f WorkingFromXYZ;
@@ -256,6 +267,10 @@ public:
 		SHADER_PARAMETER(float, InvLUTSizeMinusOne)
 		SHADER_PARAMETER(uint32, LookMode)
 		SHADER_PARAMETER(uint32, ContrastMode)
+		SHADER_PARAMETER(uint32, TonemapperMode)      // 0 = AgX, 1 = GT7 Color Volume Mapping
+		SHADER_PARAMETER(FVector4f, GT7_Param)        // x=targetLuminance(nits), y=blendRatio, z=sdrCorrectionFactor, w=preExposure(always 1)
+		SHADER_PARAMETER(FVector4f, GT7_Curve)        // x=midPoint, y=linearSection, z=toeStrength, w=alpha
+		SHADER_PARAMETER(FVector4f, GT7_Chroma)       // x=fadeStart, y=fadeEnd, z/w unused
 		SHADER_PARAMETER_RDG_TEXTURE(Texture2D, AgXContrastLUT)
 		SHADER_PARAMETER_SAMPLER(SamplerState, AgXContrastLUTSampler)
 		SHADER_PARAMETER_RDG_TEXTURE(Texture3D, InnerLUT)
@@ -355,7 +370,9 @@ FRDGTextureRef AddTonemapMasterCombineLUTPass(
 	FTonemapMasterGradingLUTCache& Cache,
 	FTextureRHIRef AgXContrastLUTRHI,
 	uint32 LookMode,
-	uint32 ContrastMode)
+	uint32 ContrastMode,
+	uint32 TonemapperMode,
+	const FTonemapMasterGT7Settings& GT7Settings)
 {
 	const FSceneViewFamily& ViewFamily = *View.Family;
 
@@ -460,6 +477,15 @@ FRDGTextureRef AddTonemapMasterCombineLUTPass(
 
 		Key.LookMode = LookMode;
 		Key.ContrastMode = ContrastMode;
+		Key.TonemapperMode = TonemapperMode;
+		Key.GT7TargetLuminance = GT7Settings.TargetLuminance;
+		Key.GT7BlendRatio = GT7Settings.BlendRatio;
+		Key.GT7CurveMidPoint = GT7Settings.CurveMidPoint;
+		Key.GT7CurveLinearSection = GT7Settings.CurveLinearSection;
+		Key.GT7CurveToeStrength = GT7Settings.CurveToeStrength;
+		Key.GT7CurveAlpha = GT7Settings.CurveAlpha;
+		Key.GT7ChromaFadeStart = GT7Settings.ChromaFadeStart;
+		Key.GT7ChromaFadeEnd = GT7Settings.ChromaFadeEnd;
 
 		// Working color space contents (engine: FCachedLUTSettings::UpdateCachedValues ~362-371).
 		const FWorkingColorSpaceShaderParameters* WorkingColorSpaceParams =
@@ -575,6 +601,20 @@ FRDGTextureRef AddTonemapMasterCombineLUTPass(
 	PassParameters->InvLUTSizeMinusOne = 1.f / (LUTSize - 1);
 	PassParameters->LookMode = LookMode;
 	PassParameters->ContrastMode = ContrastMode;
+	PassParameters->TonemapperMode = TonemapperMode;
+	{
+		// SDR: resolve the target to the 100-nit reference so the GT7 curve's
+		// peakIntensity is 1.0 in frame-buffer space (see header note).
+		// HDR: use the user target luminance. sdrCorrectionFactor stays 1.0.
+		const bool bIsHDROutput = OutputDeviceParams.OutputDevice >= (uint32)EDisplayOutputFormat::HDR_ACES_1000nit_ST2084;
+		const float TargetNits = bIsHDROutput ? GT7Settings.TargetLuminance : 100.0f;
+
+		// preExposure MUST stay 1.0: the LUT is a pure color transform; scene
+		// exposure is applied outside the LUT by the tonemap pass.
+		PassParameters->GT7_Param = FVector4f(TargetNits, GT7Settings.BlendRatio, 1.0f, 1.0f);
+		PassParameters->GT7_Curve = FVector4f(GT7Settings.CurveMidPoint, GT7Settings.CurveLinearSection, GT7Settings.CurveToeStrength, GT7Settings.CurveAlpha);
+		PassParameters->GT7_Chroma = FVector4f(GT7Settings.ChromaFadeStart, GT7Settings.ChromaFadeEnd, 0.0f, 0.0f);
+	}
 	PassParameters->AgXContrastLUT = GraphBuilder.RegisterExternalTexture(
 		CreateRenderTarget(AgXContrastLUTRHI, TEXT("TonemapMaster.AgXContrastLUT")),
 		ERDGTextureFlags::MultiFrame);

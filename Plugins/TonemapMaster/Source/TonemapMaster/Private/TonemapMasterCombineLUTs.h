@@ -1,6 +1,7 @@
 // Copyright (c) 2026. TonemapMaster plugin.
 //
-// Pass A — AgX grading-LUT builder. Port of the engine's
+// Pass A — grading-LUT builder for the unified AgX/GT7 tonemapper. Port of
+// the engine's
 //   Source/Runtime/Renderer/Private/PostProcess/PostProcessCombineLUTs.{h,cpp}
 // adapted to FSceneView-only inputs (FViewInfo and the Renderer-private
 // helpers are not accessible from a plugin).
@@ -113,6 +114,22 @@ FTonemapMasterOutputDeviceParameters GetTonemapMasterOutputDeviceParameters(cons
 // LUTMax when sampling it per-pixel.
 float GetTonemapMasterLUTMax(const FTonemapMasterOutputDeviceParameters& Parameters);
 
+// GT7 Color Volume Mapping settings snapshot. Read from the
+// r.TonemapMaster.GT7.* CVars on the render thread by the scene view
+// extension and hashed into the LUT key. Defaults match Polyphony Digital's
+// reference implementation (gt7_tone_mapping.cpp, SIGGRAPH 2025).
+struct FTonemapMasterGT7Settings
+{
+	float TargetLuminance = 1000.0f; // nits; HDR only — SDR resolves to the 100-nit reference
+	float BlendRatio = 0.6f;
+	float CurveMidPoint = 0.538f;
+	float CurveLinearSection = 0.444f;
+	float CurveToeStrength = 1.28f;
+	float CurveAlpha = 0.25f;
+	float ChromaFadeStart = 0.98f;
+	float ChromaFadeEnd = 1.16f;
+};
+
 // Builds (or returns the cached) 3D grading LUT volume texture for this view,
 // dispatching the TonemapMasterCombineLUTs compute pass when the inputs
 // changed. Render thread only.
@@ -122,4 +139,6 @@ FRDGTextureRef AddTonemapMasterCombineLUTPass(
 	FTonemapMasterGradingLUTCache& Cache,
 	FTextureRHIRef AgXContrastLUTRHI,
 	uint32 LookMode,
-	uint32 ContrastMode);
+	uint32 ContrastMode,
+	uint32 TonemapperMode,
+	const FTonemapMasterGT7Settings& GT7Settings);

@@ -3,7 +3,7 @@
 	"Version": 1,
 	"VersionName": "1.0",
 	"FriendlyName": "TonemapMaster",
-	"Description": "Replaces the engine filmic tonemapper with a custom AgX tonemapper, injected at EPostProcessingPass::ReplacingTonemapper through a SceneViewExtension. No engine source modifications.",
+	"Description": "Replaces the engine filmic tonemapper with a unified tonemapper system — AgX or GT7 Color Volume Mapping — injected at EPostProcessingPass::ReplacingTonemapper through a SceneViewExtension. No engine source modifications.",
 	"Category": "Rendering",
 	"CreatedBy": "Mazeline",
 	"CreatedByURL": "https://mazeline.tech/",

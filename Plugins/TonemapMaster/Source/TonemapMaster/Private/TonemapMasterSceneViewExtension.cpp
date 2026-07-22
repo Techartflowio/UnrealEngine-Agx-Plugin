@@ -25,7 +25,7 @@
 static TAutoConsoleVariable<int32> CVarTonemapMasterEnable(
 	TEXT("r.TonemapMaster.Enable"),
 	1,
-	TEXT("Replace the engine filmic tonemapper with the TonemapMaster AgX tonemapper.\n")
+	TEXT("Replace the engine filmic tonemapper with the TonemapMaster unified tonemapper (AgX or GT7, per r.TonemapMaster.Mode).\n")
 	TEXT(" 0: engine tonemapper\n")
 	TEXT(" 1: TonemapMaster AgX (default)"),
 	ECVF_RenderThreadSafe);
@@ -47,6 +47,63 @@ static TAutoConsoleVariable<int32> CVarTonemapMasterContrastMode(
 	TEXT(" 1: polynomial approximation from Benjamin Wrensch's minimal AgX\n")
 	TEXT("    (https://iolite-engine.com/blog_posts/minimal_agx_implementation),\n")
 	TEXT("    max error ~5.8e-3 near x=0.95, i.e. <1/255 in the extreme highlights"),
+	ECVF_RenderThreadSafe);
+
+static TAutoConsoleVariable<int32> CVarTonemapMasterMode(
+	TEXT("r.TonemapMaster.Mode"),
+	0,
+	TEXT("Tonemapper used when r.TonemapMaster.Enable=1. Baked into the grading LUT by Pass A.\n")
+	TEXT(" 0: AgX (default)\n")
+	TEXT(" 1: GT7 Color Volume Mapping (Polyphony Digital, SIGGRAPH 2025)"),
+	ECVF_RenderThreadSafe);
+
+static TAutoConsoleVariable<float> CVarTonemapMasterGT7TargetLuminance(
+	TEXT("r.TonemapMaster.GT7.TargetLuminance"),
+	1000.0f,
+	TEXT("GT7: target display peak luminance in nits (250-10000). HDR output only;\n")
+	TEXT("SDR resolves to the 100-nit reference. Reserved for future HDR support."),
+	ECVF_RenderThreadSafe);
+
+static TAutoConsoleVariable<float> CVarTonemapMasterGT7BlendRatio(
+	TEXT("r.TonemapMaster.GT7.BlendRatio"),
+	0.6f,
+	TEXT("GT7: blend between the per-channel curve (0) and the ICtCp chroma-preserved result (1)."),
+	ECVF_RenderThreadSafe);
+
+static TAutoConsoleVariable<float> CVarTonemapMasterGT7CurveMidPoint(
+	TEXT("r.TonemapMaster.GT7.CurveMidPoint"),
+	0.538f,
+	TEXT("GT7 tone curve: toe/linear transition point (0.1-1.0)."),
+	ECVF_RenderThreadSafe);
+
+static TAutoConsoleVariable<float> CVarTonemapMasterGT7CurveLinearSection(
+	TEXT("r.TonemapMaster.GT7.CurveLinearSection"),
+	0.444f,
+	TEXT("GT7 tone curve: linear/shoulder boundary as a fraction of peak (0.1-2.0)."),
+	ECVF_RenderThreadSafe);
+
+static TAutoConsoleVariable<float> CVarTonemapMasterGT7CurveToeStrength(
+	TEXT("r.TonemapMaster.GT7.CurveToeStrength"),
+	1.28f,
+	TEXT("GT7 tone curve: toe region gamma (0.5-3.0). Values >1 darken shadows/midtones."),
+	ECVF_RenderThreadSafe);
+
+static TAutoConsoleVariable<float> CVarTonemapMasterGT7CurveAlpha(
+	TEXT("r.TonemapMaster.GT7.CurveAlpha"),
+	0.25f,
+	TEXT("GT7 tone curve: shoulder convergence speed (0.01-1.5). Lower = harder clip, higher = softer rolloff."),
+	ECVF_RenderThreadSafe);
+
+static TAutoConsoleVariable<float> CVarTonemapMasterGT7ChromaFadeStart(
+	TEXT("r.TonemapMaster.GT7.ChromaFadeStart"),
+	0.98f,
+	TEXT("GT7: chroma preservation fade start, relative to target luminance in ICtCp I (0-2)."),
+	ECVF_RenderThreadSafe);
+
+static TAutoConsoleVariable<float> CVarTonemapMasterGT7ChromaFadeEnd(
+	TEXT("r.TonemapMaster.GT7.ChromaFadeEnd"),
+	1.16f,
+	TEXT("GT7: chroma preservation fade end, relative to target luminance in ICtCp I (0-2)."),
 	ECVF_RenderThreadSafe);
 
 // Pass B — per-pixel tonemap replacement: scene color + bloom -> exposure ->
@@ -240,17 +297,28 @@ FScreenPassTexture FTonemapMasterSceneViewExtension::ReplaceTonemapper_RenderThr
 
 	const uint32 LookMode = (uint32)FMath::Clamp(CVarTonemapMasterLook.GetValueOnRenderThread(), 0, 2);
 	const uint32 ContrastMode = (uint32)FMath::Clamp(CVarTonemapMasterContrastMode.GetValueOnRenderThread(), 0, 1);
+	const uint32 TonemapperMode = (uint32)FMath::Clamp(CVarTonemapMasterMode.GetValueOnRenderThread(), 0, 1);
+
+	FTonemapMasterGT7Settings GT7Settings; // defaults match the GT7 reference implementation
+	GT7Settings.TargetLuminance  = FMath::Clamp(CVarTonemapMasterGT7TargetLuminance.GetValueOnRenderThread(), 250.0f, 10000.0f);
+	GT7Settings.BlendRatio       = FMath::Clamp(CVarTonemapMasterGT7BlendRatio.GetValueOnRenderThread(), 0.0f, 1.0f);
+	GT7Settings.CurveMidPoint    = FMath::Clamp(CVarTonemapMasterGT7CurveMidPoint.GetValueOnRenderThread(), 0.1f, 1.0f);
+	GT7Settings.CurveLinearSection = FMath::Clamp(CVarTonemapMasterGT7CurveLinearSection.GetValueOnRenderThread(), 0.1f, 2.0f);
+	GT7Settings.CurveToeStrength = FMath::Clamp(CVarTonemapMasterGT7CurveToeStrength.GetValueOnRenderThread(), 0.5f, 3.0f);
+	GT7Settings.CurveAlpha       = FMath::Clamp(CVarTonemapMasterGT7CurveAlpha.GetValueOnRenderThread(), 0.01f, 1.5f);
+	GT7Settings.ChromaFadeStart  = FMath::Clamp(CVarTonemapMasterGT7ChromaFadeStart.GetValueOnRenderThread(), 0.0f, 2.0f);
+	GT7Settings.ChromaFadeEnd    = FMath::Clamp(CVarTonemapMasterGT7ChromaFadeEnd.GetValueOnRenderThread(), 0.0f, 2.0f);
 
 	// ------------------------------------------------------------------
 	// Pass A: build (or reuse the cached) 3D grading LUT containing the full
-	// engine color grading + AgX tone curve + output device encoding. This is
+	// engine color grading + unified tonemapper (AgX or GT7) tone curve + output device encoding. This is
 	// what the engine's AddCombineLUTPass would produce for the filmic
 	// tonemapper; the engine skips it entirely when a ReplacingTonemapper
 	// delegate exists (PostProcessing.cpp ~line 1085), so we build our own.
 	// ------------------------------------------------------------------
 	FTextureRHIRef AgXContrastLUTRHI = GetOrCreateAgXContrastLUT_RenderThread();
 	FRDGTextureRef ColorGradingLUT = AddTonemapMasterCombineLUTPass(
-		GraphBuilder, View, GradingLUTCache, AgXContrastLUTRHI, LookMode, ContrastMode);
+		GraphBuilder, View, GradingLUTCache, AgXContrastLUTRHI, LookMode, ContrastMode, TonemapperMode, GT7Settings);
 
 	// ------------------------------------------------------------------
 	// Pass B: per-pixel exposure + bloom + vignette + LUT sample.
@@ -346,7 +414,7 @@ FScreenPassTexture FTonemapMasterSceneViewExtension::ReplaceTonemapper_RenderThr
 
 	AddDrawScreenPass(
 		GraphBuilder,
-		RDG_EVENT_NAME("TonemapMaster.AgX LUT (%dx%d)", OutputViewport.Rect.Width(), OutputViewport.Rect.Height()),
+		RDG_EVENT_NAME("TonemapMaster.%s LUT (%dx%d)", TonemapperMode == 1 ? TEXT("GT7") : TEXT("AgX"), OutputViewport.Rect.Width(), OutputViewport.Rect.Height()),
 		View,
 		OutputViewport,
 		SceneColorViewport,

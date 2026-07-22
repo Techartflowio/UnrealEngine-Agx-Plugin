@@ -1,13 +1,16 @@
 // Copyright (c) 2026. TonemapMaster plugin.
 //
-// Pass A — AgX grading-LUT builder (compute, 32^3 volume by default).
+// Pass A — Unified tonemapper grading-LUT builder (compute, 32^3 volume by default).
 //
 // This is a PORT of the engine's grading LUT builder:
 //   Engine/Shaders/Private/PostProcessCombineLUTs.usf (UE 5.8)
 // with exactly one algorithmic change: at the FilmToneMap() call site in
 // ComputeFilmColorNoGamma() (engine line ~184) we substitute the plugin's
-// verified AgX pipeline (ported from the replaced per-pixel TonemapMasterPS.usf,
-// itself following sobotka/AgX and Wrensch's minimal AgX). Everything else —
+// unified tonemapper, selected by the TonemapperMode uniform:
+//   mode 0 — AgX (ported from the replaced per-pixel TonemapMasterPS.usf,
+//            itself following sobotka/AgX and Wrensch's minimal AgX);
+//   mode 1 — GT7 (Gran Turismo 7) Color Volume Mapping (GT7Tonemapper.ush,
+//            HLSL port of Polyphony Digital's MIT-licensed gt7_tone_mapping.cpp). Everything else —
 // white balance, ExpandGamut, ColorCorrectAll (global + shadows/midtones/
 // highlights grading), BlueCorrection, legacy LDR LUT blending, ColorCorrection
 // mapping polynomial, OverlayColor, output-device EOTF encoding — is the
@@ -38,6 +41,7 @@
 #include "/Engine/Private/Common.ush"
 #include "/Engine/Private/PostProcessCommon.ush"
 #include "/Engine/Private/TonemapCommon.ush"
+#include "/Plugin/TonemapMaster/GT7Tonemapper.ush"
 
 // The engine sets TONEMAPPING_METHOD through a permutation on ETonemappingMethod.
 // We support the Filmic path only (see header comment).
@@ -369,17 +373,28 @@ float3 ComputeFilmColorNoGamma(float3 ColorAP1)
 	// Blue correction
 	ColorAP1 = lerp( ColorAP1, mul( BlueCorrectAP1, ColorAP1 ), BlueCorrection );
 
-	// --- TonemapMaster: AgX replaces the engine's FilmToneMap(ColorAP1) here
-	// (engine: PostProcessCombineLUTs.usf line ~184). AgX expects BT.709/sRGB
-	// primaries; convert AP1 <-> sRGB with primary-only matrices and NO
-	// D60<->D65 chromatic adaptation (matches the PostProcessCombineLUTs_5.7.usf
-	// reference: avoids baking a white point shift into the nonlinear AgX
-	// sigmoid). ---
-	const float3x3 AgxAP1_2_Linear = mul( XYZ_2_sRGB_MAT, AP1_2_XYZ_MAT );
-	const float3x3 AgxLinear_2_AP1 = mul( XYZ_2_AP1_MAT, sRGB_2_XYZ_MAT );
-	float3 ColorWorking = mul( AgxAP1_2_Linear, ColorAP1 );
-	float3 ToneMappedWorking = ApplyAgXLinear( ColorWorking );
-	float3 ToneMappedColorAP1 = mul( AgxLinear_2_AP1, ToneMappedWorking );
+	// --- TonemapMaster: the engine's FilmToneMap(ColorAP1) call site (engine:
+	// PostProcessCombineLUTs.usf line ~184) is replaced by the unified
+	// tonemapper: AgX (mode 0) or GT7 Color Volume Mapping (mode 1).
+	// AgX expects BT.709/sRGB primaries; convert AP1 <-> sRGB with primary-only
+	// matrices and NO D60<->D65 chromatic adaptation (matches the
+	// PostProcessCombineLUTs_5.7.usf reference). GT7 handles its own
+	// AP1 <-> Rec.2020 conversion WITH chromatic adaptation (ICtCp requires
+	// Rec.2020/D65). ---
+	float3 ToneMappedColorAP1;
+	BRANCH
+	if (TonemapperMode == 1)
+	{
+		ToneMappedColorAP1 = GranTurismoToneMap(ColorAP1);
+	}
+	else
+	{
+		const float3x3 AgxAP1_2_Linear = mul( XYZ_2_sRGB_MAT, AP1_2_XYZ_MAT );
+		const float3x3 AgxLinear_2_AP1 = mul( XYZ_2_AP1_MAT, sRGB_2_XYZ_MAT );
+		float3 ColorWorking = mul( AgxAP1_2_Linear, ColorAP1 );
+		float3 ToneMappedWorking = ApplyAgXLinear( ColorWorking );
+		ToneMappedColorAP1 = mul( AgxLinear_2_AP1, ToneMappedWorking );
+	}
 	ColorAP1 = lerp(ColorAP1, ToneMappedColorAP1, ToneCurveAmount);
 
 	// Uncorrect blue to maintain white point

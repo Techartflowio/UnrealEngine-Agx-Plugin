@@ -1,0 +1,216 @@
+// Copyright (c) 2026. TonemapMaster plugin.
+//
+// HLSL port of Polyphony Digital's MIT-licensed gt7_tone_mapping.cpp
+// (SIGGRAPH 2025 Shading Course) — the GT7 (Gran Turismo 7) Color Volume
+// Mapping tonemapper. The original C++ source is available under the
+// MIT license, reproduced in full below:
+//
+// MIT License
+//
+// Copyright (c) 2025 Polyphony Digital Inc.
+//
+// Permission is hereby granted, free of charge, to any person obtaining a copy
+// of this software and associated documentation files (the "Software"), to deal
+// in the Software without restriction, including without limitation the rights
+// to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+// copies of the Software, and to permit persons to whom the Software is
+// furnished to do so, subject to the following conditions:
+//
+// The above copyright notice and this permission notice shall be included in all
+// copies or substantial portions of the Software.
+//
+// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+// IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+// FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+// AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+// LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+// OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+// SOFTWARE.
+
+// Uniforms bound by name from the C++ SceneViewExtension (shared contract):
+uint   TonemapperMode; // 0 = AgX, 1 = GT7 Color Volume Mapping
+float4 GT7_Param;      // x=targetLuminance(nits, already SDR/HDR-resolved), y=blendRatio, z=sdrCorrectionFactor, w=preExposure (always 1.0)
+float4 GT7_Curve;      // x=midPoint, y=linearSection, z=toeStrength, w=alpha
+float4 GT7_Chroma;     // x=fadeStart, y=fadeEnd, z/w unused
+
+static const float GT7_REFERENCE_LUMINANCE = 100.0; // frame-buffer 1.0 == 100 nits
+
+float GT7_FrameBufferToPhysical(float fbValue) { return fbValue * GT7_REFERENCE_LUMINANCE; }
+float GT7_PhysicalToFrameBuffer(float physical) { return physical / GT7_REFERENCE_LUMINANCE; }
+
+float GT7_SmoothStep(float x, float edge0, float edge1)
+{
+    float t = (x - edge0) / (edge1 - edge0);
+    if (x < edge0) return 0.0;
+    if (x > edge1) return 1.0;
+    return t * t * (3.0 - 2.0 * t);
+}
+
+// Chroma preservation fades out between fadeStart and fadeEnd.
+float GT7_ChromaCurve(float x, float a, float b) { return 1.0 - GT7_SmoothStep(x, a, b); }
+
+// SMPTE ST-2084 (PQ) EOTF: PQ code value -> frame-buffer linear.
+float GT7_EOTF_ST2084(float n, float exponentScaleFactor)
+{
+    n = saturate(n);
+    const float m1 = 0.1593017578125;
+    const float m2 = 78.84375 * exponentScaleFactor;
+    const float c1 = 0.8359375;
+    const float c2 = 18.8515625;
+    const float c3 = 18.6875;
+    const float pqC = 10000.0;
+
+    float np = pow(n, 1.0 / m2);
+    float l = max(0.0, np - c1);
+    l = l / (c2 - c3 * np);
+    l = pow(l, 1.0 / m1);
+    return GT7_PhysicalToFrameBuffer(l * pqC);
+}
+
+// Inverse ST-2084: frame-buffer linear -> PQ code value.
+// exp2/log2 form instead of pow(a/b, m2): faster on GPU, same result.
+float GT7_InvEOTF_ST2084(float v, float exponentScaleFactor)
+{
+    const float m1 = 0.1593017578125;
+    const float m2 = 78.84375 * exponentScaleFactor;
+    const float c1 = 0.8359375;
+    const float c2 = 18.8515625;
+    const float c3 = 18.6875;
+    const float pqC = 10000.0;
+
+    float physical = GT7_FrameBufferToPhysical(max(v, 0.0));
+    float y = min(physical / pqC, 1.0);
+    float ym = pow(y, m1);
+    return saturate(exp2(m2 * (log2(c1 + c2 * ym) - log2(1.0 + c3 * ym))));
+}
+
+// ICtCp (ITU-T T.302), input: linear Rec.2020.
+void GT7_RGBToICtCp(float3 rgb, out float3 ictCp)
+{
+    float l = (rgb.r * 1688.0 + rgb.g * 2146.0 + rgb.b *  262.0) / 4096.0;
+    float m = (rgb.r *  683.0 + rgb.g * 2951.0 + rgb.b *  462.0) / 4096.0;
+    float s = (rgb.r *   99.0 + rgb.g *  309.0 + rgb.b * 3688.0) / 4096.0;
+
+    float lPQ = GT7_InvEOTF_ST2084(l, 1.0);
+    float mPQ = GT7_InvEOTF_ST2084(m, 1.0);
+    float sPQ = GT7_InvEOTF_ST2084(s, 1.0);
+
+    ictCp.x = ( 2048.0 * lPQ +  2048.0 * mPQ               ) / 4096.0; // I  (intensity)
+    ictCp.y = ( 6610.0 * lPQ - 13613.0 * mPQ + 7003.0 * sPQ) / 4096.0; // Ct (tritan)
+    ictCp.z = (17933.0 * lPQ - 17390.0 * mPQ -  543.0 * sPQ) / 4096.0; // Cp (protan)
+}
+
+// ICtCp -> linear Rec.2020. RGB clamps match the reference implementation.
+void GT7_ICtCpToRGB(float3 ictCp, out float3 rgb)
+{
+    float l = ictCp.x + 0.00860904 * ictCp.y + 0.11103  * ictCp.z;
+    float m = ictCp.x - 0.00860904 * ictCp.y - 0.11103  * ictCp.z;
+    float s = ictCp.x + 0.560031   * ictCp.y - 0.320627 * ictCp.z;
+
+    float lLin = GT7_EOTF_ST2084(l, 1.0);
+    float mLin = GT7_EOTF_ST2084(m, 1.0);
+    float sLin = GT7_EOTF_ST2084(s, 1.0);
+
+    rgb.r = max( 3.43661   * lLin - 2.50645  * mLin + 0.0698454 * sLin, 0.0);
+    rgb.g = max(-0.79133   * lLin + 1.9836   * mLin - 0.192271  * sLin, 0.0);
+    rgb.b = max(-0.0259499 * lLin - 0.0989137* mLin + 1.12486   * sLin, 0.0);
+}
+
+// "GT Tone Mapping" curve with convergent shoulder: power-law toe, 1:1 linear
+// mid-section, exponential shoulder converging to peakIntensity.
+// Guards (alpha ~= 1, degenerate k) extend the reference for shader robustness.
+float GT7_EvaluateCurve(float x, float peakIntensity, float alpha,
+                        float midPoint, float linearSection, float toeStrength)
+{
+    if (x <= 0.0) return 0.0;
+    if (peakIntensity <= 0.0) return 0.0;
+    float denomAlpha = alpha - 1.0;
+    if (abs(denomAlpha) < 1e-6) return x; // alpha ~= 1.0: linear passthrough guard
+
+    float k = (linearSection - 1.0) / denomAlpha;
+    float denomK = k * peakIntensity;
+    if (abs(denomK) < 1e-6) return x;
+
+    float kA = peakIntensity * linearSection + peakIntensity * k;
+    float kB = -peakIntensity * k * exp(linearSection / k);
+    float kC = -1.0 / denomK;
+
+    float weightLinear = GT7_SmoothStep(x, 0.0, midPoint);
+    float weightToe = 1.0 - weightLinear;
+
+    float shoulder = kA + kB * exp(x * kC);
+
+    if (x < linearSection * peakIntensity)
+    {
+        float toeMapped = midPoint * pow(max(x / midPoint, 0.0001), toeStrength);
+        return weightToe * toeMapped + weightLinear * x;
+    }
+    return shoulder;
+}
+
+// GT7 Color Volume Mapping, 5 stages. Input/output: linear Rec.2020 frame-buffer values.
+float3 GT7_ColorVolumeMap(float3 rgb)
+{
+    float preExposure   = GT7_Param.w; // always 1.0 in the LUT builder (pure color transform)
+    float peakIntensity = GT7_PhysicalToFrameBuffer(GT7_Param.x);
+    float blendRatio    = GT7_Param.y;
+    float sdrCorrection = GT7_Param.z;
+    float midPoint      = GT7_Curve.x;
+    float linearSection = GT7_Curve.y;
+    float toeStrength   = GT7_Curve.z;
+    float alpha         = GT7_Curve.w;
+    float fadeStart     = GT7_Chroma.x;
+    float fadeEnd       = GT7_Chroma.y;
+
+    // Stage 1: pre-exposure (identity in the LUT path; kept for reference fidelity).
+    rgb *= preExposure;
+
+    // Stage 2: ICtCp of the source color (chroma reference) and of the peak gray.
+    float3 grayRgb = float3(peakIntensity, peakIntensity, peakIntensity);
+    float3 grayUcs;
+    GT7_RGBToICtCp(grayRgb, grayUcs);
+    float framebufferLuminanceTargetUcs = grayUcs.x;
+
+    float3 ucs;
+    GT7_RGBToICtCp(rgb, ucs);
+
+    // Stage 3: per-channel tone curve in RGB space ("skewed" color).
+    float3 skewedRgb;
+    skewedRgb.r = GT7_EvaluateCurve(rgb.r, peakIntensity, alpha, midPoint, linearSection, toeStrength);
+    skewedRgb.g = GT7_EvaluateCurve(rgb.g, peakIntensity, alpha, midPoint, linearSection, toeStrength);
+    skewedRgb.b = GT7_EvaluateCurve(rgb.b, peakIntensity, alpha, midPoint, linearSection, toeStrength);
+
+    // Stage 4: chroma preservation — take luminance from the skewed color but
+    // chroma (Ct, Cp) from the ORIGINAL color, faded out near peak luminance.
+    float3 skewedUcs;
+    GT7_RGBToICtCp(skewedRgb, skewedUcs);
+
+    float chromaScale = GT7_ChromaCurve(
+        ucs.x / max(framebufferLuminanceTargetUcs, 1e-6), fadeStart, fadeEnd);
+    float3 scaledUcs = float3(skewedUcs.x, ucs.y * chromaScale, ucs.z * chromaScale);
+
+    float3 scaledRgb;
+    GT7_ICtCpToRGB(scaledUcs, scaledRgb);
+
+    // Stage 5: blend per-channel and chroma-preserved results, clamp to peak.
+    float3 blended;
+    blended.r = (1.0 - blendRatio) * skewedRgb.r + blendRatio * scaledRgb.r;
+    blended.g = (1.0 - blendRatio) * skewedRgb.g + blendRatio * scaledRgb.g;
+    blended.b = (1.0 - blendRatio) * skewedRgb.b + blendRatio * scaledRgb.b;
+
+    blended = min(blended, peakIntensity);
+    return sdrCorrection * blended;
+}
+
+// Entry point called from ComputeFilmColorNoGamma(). AP1 (ACEScg, D60) in/out —
+// same contract as the engine's FilmToneMap(). ICtCp is defined for Rec.2020
+// (D65), so convert with chromatic adaptation transforms (CAT).
+float3 GranTurismoToneMap(float3 ColorAP1)
+{
+    const float3x3 AP1_2_Rec2020 = mul(XYZ_2_Rec2020_MAT, mul(D60_2_D65_CAT, AP1_2_XYZ_MAT));
+    const float3x3 Rec2020_2_AP1 = mul(XYZ_2_AP1_MAT,     mul(D65_2_D60_CAT, Rec2020_2_XYZ_MAT));
+
+    float3 ColorRec2020  = mul(AP1_2_Rec2020, ColorAP1);
+    float3 MappedRec2020 = GT7_ColorVolumeMap(ColorRec2020);
+    return mul(Rec2020_2_AP1, MappedRec2020);
+}
